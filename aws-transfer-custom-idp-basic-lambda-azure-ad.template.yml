@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Configures SFTP Transfer Family with Lambda Authentication and a custom Lambda function to integrate with Azure AD
+Parameters:
+    AzureClientId:
+        Type: String
+        Description: Azure Client ID
+        NoEcho: true
+    AzureDomain:
+        Type: String
+        Description: Domain name associated with Azure AD, e.g. example.com
+        NoEcho: true
+    S3BucketName:
+        Type: String
+        Description: Name of an existing S3 Bucket you will use for SFTP Storage
+Resources:
+  AzureClientIdSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: SFTPAzureAdClientId
+      Name: SFTPAzureAdClientId
+      SecretString: !Sub
+                - '{ "AzureADClientID" : "${ClientIDParam}" }'
+                - ClientIDParam: !Ref AzureClientId
+      Tags:
+          - Key: "blogOrigin"
+            Value: "TransferFamilyAzureADIdP"
+  AzureDomainSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: SFTPAzureDomain
+      Name: SFTPAzureDomain
+      SecretString: !Sub
+                - '{ "AzureADDomain" : "${DomainParam}" }'
+                - DomainParam: !Ref AzureDomain
+      Tags:
+          - Key: "blogOrigin"
+            Value: "TransferFamilyAzureADIdP"
+  S3TransferAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - transfer.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: SftpListAllBucketsPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:ListAllMyBuckets
+            - s3:GetBucketLocation
+            Resource: '*'
+      - PolicyName: SftpListHomeS3BucketPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:ListBucket
+            - s3:GetBucketLocation
+            Resource: !Sub
+                - 'arn:aws:s3:::${BucketName}'
+                - BucketName: !Ref S3BucketName
+      - PolicyName: SftpReadWriteHomeBucketAccessPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:DeleteObjectVersion
+            - s3:DeleteObject
+            - s3:GetObjectVersion
+            Resource: !Sub
+                - 'arn:aws:s3:::${BucketName}/*/*'
+                - BucketName: !Ref S3BucketName
+      Tags:
+          - Key: "blogOrigin"
+            Value: "TransferFamilyAzureADIdP"
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: LambdaCWLoggingPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:*
+            Resource: arn:aws:logs:*:*:*
+      - PolicyName: SecretsManagerAccessPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            Resource:
+            - !Ref AzureClientIdSecret
+            - !Ref AzureDomainSecret
+      Tags:
+          - Key: "blogOrigin"
+            Value: "TransferFamilyAzureADIdP"
+  TransferFamilyLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - transfer.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: AWSTransferLoggingPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:DescribeLogStreams
+            - logs:PutLogEvents
+            Resource: 'arn:aws:logs:*:*:log-group:/aws/transfer/*'
+      Tags:
+          - Key: "blogOrigin"
+            Value: "TransferFamilyAzureADIdP"
+  AzureADLambdaFunction:
+    DependsOn:
+        - AzureClientIdSecret
+        - AzureDomainSecret
+    Type: AWS::Lambda::Function
+    Properties:
+      Environment:
+        Variables:
+          AzureClientId: !Ref AzureClientId
+          AzureDomain: !Ref AzureDomain
+          AzureClientIdSecret: SFTPAzureAdClientId
+          AzureClientIdSecretKey: AzureADClientID
+          AzureDomainSecret: SFTPAzureDomain
+          AzureDomainSecretKey: AzureADDomain
+          Region: !Ref "AWS::Region"
+          S3BucketName: !Ref S3BucketName
+          S3RoleARN: !GetAtt S3TransferAccessRole.Arn
+      Runtime: nodejs16.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          const AWS = require ('aws-sdk');
+          const QueryString = require('querystring');
+          const HTTPS = require ('https');
+
+          //Secrets Manager Client Setup
+          const region = process.env.Region;
+          const secretsManagerClient = new AWS.SecretsManager({
+              region: region
+          });
+
+          var httpsRequest = (options, data) => new Promise((resolve) => {
+              const request = HTTPS.request(options, res => {
+                  var char = '';
+                  res.on('data', d => {
+                      char += d
+                  }).on('end', () => {
+                      var response = JSON.parse(char.toString());
+                      response.statusCode = res.statusCode;
+                      resolve(response)
+                  })
+              });
+              request.on('error', error => {
+                  console.error('error', error)
+              });
+              if (data) {
+                  request.write(data)
+              };
+              request.end()
+          });
+
+          var sftpUserScopedPolicy = {
+              Version: '2012-10-17',
+              Statement: [{
+                  Sid: 'allowFolderList',
+                  Action: ['s3:ListBucket', 's3:GetBucketLocation'],
+                  Effect: 'Allow',
+                  Resource: ['arn:aws:s3:::${transfer:HomeBucket}'],
+              }, {
+                  Sid: 'allowListBuckets',
+                  Effect: 'Allow',
+                  Action: ['s3:ListAllMyBuckets', 's3:GetBucketLocation'],
+                  Resource: '*'
+              }, {
+                  Sid: 'HomeDirectoryAccess',
+                  Effect: 'Allow',
+                  Action: ['s3:PutObject', 's3:GetObject', 's3:DeleteObjectVersion', 's3:DeleteObject', 's3:GetObjectVersion'],
+                  Resource: ['arn:aws:s3:::${transfer:HomeDirectory}/*']
+              }, {
+                  Sid: 'DenyDeletionOfHomeDirectory',
+                  Effect: 'Deny',
+                  Action: ['s3:DeleteObjectVersion', 's3:DeleteObject'],
+                  Resource: ['arn:aws:s3:::${transfer:HomeDirectory}/']
+              }]
+          }
+
+
+
+          async function getSecret(secretName) {
+
+            /* this will return promise,
+            if you add .promise() at the end aws-sdk calls will return a promise
+            no need to wrap in custom one
+            */
+            const response = await secretsManagerClient
+                                    .getSecretValue({ SecretId: secretName })
+                                      .promise();
+
+            //what is left is to return the right data
+            if ("SecretString" in response) {
+              return response.SecretString;
+            }
+
+            return Buffer.from(response.SecretBinary, "base64").toString("ascii");
+          }
+
+
+          exports.handler = async(event) => {
+              //get environment variables
+              const azureClientIdSecret = process.env.AzureClientIdSecret;
+              const azureDomainSecret = process.env.AzureDomainSecret;
+              const azureDomainSecretKey = process.env.AzureDomainSecretKey;
+              const azureClientIdSecretKey = process.env.AzureClientIdSecretKey;
+              const s3BucketName = process.env.S3BucketName;
+              const s3RoleARN = process.env.S3RoleARN;
+
+              //get secrets
+              var azureDomain = JSON.parse(await getSecret(azureDomainSecret));
+              azureDomain = azureDomain[azureDomainSecretKey];
+              var azureClientId = JSON.parse(await getSecret(azureClientIdSecret));
+              azureClientId = azureClientId[azureClientIdSecretKey];
+
+              //get username and add the domain to it
+              var user = event.username;
+              user = `${user}@${azureDomain}`;
+
+              console.log('user: ', user);
+              console.log('azureClientId: ', azureClientId);
+
+              //setup credentials to call Microsoft Graph
+              var microsoftGraphCredentials = {
+                  username: user,
+                  password: event.password,
+                  grant_type: 'password',
+                  scope: 'https://graph.microsoft.com/User.Read',
+                  response_type: 'token',
+                  client_id: azureClientId
+              };
+
+              var dataToPost = QueryString.stringify(microsoftGraphCredentials);
+
+              //build the post request
+              var postRequest = {
+                  method: 'POST',
+                  host: 'login.microsoftonline.com',
+                  headers: {
+                      'Accept': 'application/json',
+                      'Content-Type': 'application/x-www-form-urlencoded',
+                      'Content-Length': dataToPost.length
+                  },
+                  path: `/${azureDomain}/oauth2/v2.0/token`,
+              };
+
+              var azureToken = await httpsRequest(postRequest, dataToPost);
+              //check to see if an access token came back
+              if(!azureToken.access_token) {
+                  //auth failure, log the error
+                  if(azureToken.error) {
+                      console.log(
+                          {
+                              status: "Failure",
+                              userName: user,
+                              errorMessage: azureToken.error,
+                              errorURL: azureToken.error_uri
+                          }
+                      );
+                  }
+                  // exit because auth has failed
+                  return {}
+              } else {
+                  console.log(
+                      {
+                          status: "Success",
+                          userName: user,
+                          scope: azureToken.scope
+                      }
+                  );
+                  var response = {
+                      HomeDirectory: '/' + s3BucketName + '/' + 'home' + '/' + user,
+                      HomeBucket: s3BucketName,
+                      Policy: JSON.stringify(sftpUserScopedPolicy),
+                      Role: s3RoleARN,
+                  }
+
+                  console.log(response);
+                  return response;
+              }
+          };
+
+      Description: Invoke a function during stack creation.
+      TracingConfig:
+        Mode: Active
+      Tags:
+          - Key: "blogOrigin"
+            Value: "TransferFamilyAzureADIdP"
+  SFTPTransferServer:
+    Type : AWS::Transfer::Server
+    Properties :
+        LoggingRole: !GetAtt TransferFamilyLoggingRole.Arn
+        Protocols:
+            - SFTP
+        SecurityPolicyName: TransferSecurityPolicy-2020-06
+        IdentityProviderDetails:
+            Function: !GetAtt AzureADLambdaFunction.Arn
+        IdentityProviderType: AWS_LAMBDA
+        Tags:
+          - Key: "blogOrigin"
+            Value: "TransferFamilyAzureADIdP"
+  LambdaAccessRole:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AzureADLambdaFunction.Arn
+      Principal: transfer.amazonaws.com
+      SourceArn: !GetAtt SFTPTransferServer.Arn
